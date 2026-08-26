@@ -316,3 +316,42 @@ class TestBuildConsensusPerAllele:
             flank_length=flanks,
         )
         assert "allele_1" in result
+
+
+class TestCheckConsensusLength:
+    """Tests for check_consensus_length QC."""
+
+    def test_passes_when_within_tolerance(self, tmp_path):
+        """Exact and ±1 unit counts pass."""
+        fasta = tmp_path / "c.fa"
+        # 60 units * 60 bp = 3600 bp
+        fasta.write_text(">allele\n" + ("A" * 3600) + "\n")
+        result = check_consensus_length(fasta, expected_units=60)
+        assert result["passed"] is True
+        assert result["observed_units"] == 60
+        assert result["delta"] == 0
+
+        # ±1 tolerance for frameshift
+        fasta.write_text(">allele\n" + ("A" * 3660) + "\n")
+        result = check_consensus_length(fasta, expected_units=60)
+        assert result["passed"] is True
+        assert result["delta"] == 1
+
+    def test_fails_when_outside_tolerance(self, tmp_path):
+        """Large length mismatch fails QC."""
+        fasta = tmp_path / "c.fa"
+        # 81 units when 43 expected (barcode20-style mismatch)
+        fasta.write_text(">allele\n" + ("A" * (81 * 60)) + "\n")
+        result = check_consensus_length(fasta, expected_units=43)
+        assert result["passed"] is False
+        assert result["observed_units"] == 81
+        assert result["expected_units"] == 43
+        assert result["delta"] == 38
+
+    def test_empty_sequence(self, tmp_path):
+        """Empty consensus reports zero observed units."""
+        fasta = tmp_path / "c.fa"
+        fasta.write_text(">allele\n\n")
+        result = check_consensus_length(fasta, expected_units=50)
+        assert result["observed_units"] == 0
+        assert result["passed"] is False
