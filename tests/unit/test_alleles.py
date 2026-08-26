@@ -237,6 +237,108 @@ class TestProminencePeaks:
         assert result["allele_1"]["canonical_repeats"] == 72
 
 
+class TestReadLengthPeaks:
+    """Tests for BAM read-length secondary allele recovery."""
+
+    def test_find_read_length_peaks_keeps_longer_secondary(self):
+        """Primary short bin + weaker longer bin → both peaks."""
+        from open_pacmuci.alleles import _find_read_length_peaks
+
+        bins = {2800: 8000, 2750: 4000, 2850: 3000, 1450: 800, 4950: 300, 4900: 100, 5000: 50}
+        peaks = _find_read_length_peaks(bins)
+        assert len(peaks) == 2
+        assert peaks[0]["pos"] == 2800
+        assert peaks[1]["pos"] == 4950
+
+    def test_find_read_length_peaks_ignores_short_noise(self):
+        """Shorter fragment modes are not chosen as secondary."""
+        from open_pacmuci.alleles import _find_read_length_peaks
+
+        bins = {2800: 8000, 1450: 2000, 1700: 1500}
+        peaks = _find_read_length_peaks(bins)
+        assert len(peaks) == 1
+        assert peaks[0]["pos"] == 2800
+
+    def test_canonical_from_length_peak_calibrates_flank(self):
+        """Secondary length maps near expected contig via primary flank."""
+        from open_pacmuci.alleles import _canonical_from_length_peak
+
+        counts = {n: 50 for n in range(60, 80)}
+        counts[69] = 900
+        counts[68] = 700
+        counts[70] = 600
+        result = _canonical_from_length_peak(
+            4950,
+            {},
+            counts,
+            primary_peak_bp=2800,
+            primary_canonical=33,
+            min_coverage=10,
+        )
+        assert result == 69
+
+    def test_detect_alleles_rescues_long_allele_from_read_lengths(self):
+        """Prominence-missed long allele is recovered from length peaks."""
+        counts = {n: 80 for n in range(1, 151)}
+        for n, r in [(32, 5000), (33, 20000), (34, 19000), (35, 18000)]:
+            counts[n] = r
+        # Real but weak longer ridge (fails 5% ladder gate alone)
+        for n, r in [(68, 700), (69, 950), (70, 900)]:
+            counts[n] = r
+        for n in range(130, 151):
+            counts[n] = 90
+
+        # Without BAM → same_length (ladder prominence rejects weak secondary)
+        alone = detect_alleles(counts, min_coverage=10)
+        assert alone["same_length"] is True
+
+        def fake_hist(bam_path):
+            bins = {2800: 8000, 2750: 3000, 4950: 280, 4900: 100}
+            votes = {
+                2800: {33: 5000, 32: 1000},
+                4950: {69: 200, 68: 150},
+            }
+            return bins, votes
+
+        with patch("open_pacmuci.alleles._read_length_histograms", side_effect=fake_hist):
+            with patch("open_pacmuci.alleles.refine_peak_contig") as mock_refine:
+                mock_refine.side_effect = lambda bam, contigs: {
+                    "best_contig": contigs[len(contigs) // 2],
+                    "metrics": {},
+                }
+                result = detect_alleles(counts, min_coverage=10, bam_path=Path("fake.bam"))
+
+        assert result["same_length"] is False
+        canons = sorted(
+            [
+                result["allele_1"]["canonical_repeats"],
+                result["allele_2"]["canonical_repeats"],
+            ]
+        )
+        assert canons == [33, 69]
+
+    def test_length_rescue_does_not_invent_150_without_length_peak(self):
+        """Long-tail idxstats alone still yields same_length when BAM is unimodal."""
+        counts = {n: 80 for n in range(1, 151)}
+        for n, r in [(32, 5000), (33, 9000), (34, 10000), (35, 9500)]:
+            counts[n] = r
+        for n in range(130, 151):
+            counts[n] = 90
+
+        def fake_hist(bam_path):
+            # Only short amplicon mode — no long length peak
+            return {2800: 8000, 2750: 4000, 1450: 800}, {2800: {33: 5000}}
+
+        with patch("open_pacmuci.alleles._read_length_histograms", side_effect=fake_hist):
+            with patch("open_pacmuci.alleles.refine_peak_contig") as mock_refine:
+                mock_refine.return_value = {"best_contig": "contig_34", "metrics": {}}
+                result = detect_alleles(counts, min_coverage=10, bam_path=Path("fake.bam"))
+
+        assert result["same_length"] is True
+        assert result["allele_1"]["canonical_repeats"] == 34
+        assert result["allele_2"]["canonical_repeats"] == 34
+
+
 # ---------------------------------------------------------------------------
 # SAM output helpers for refine_peak_contig tests
 # ---------------------------------------------------------------------------

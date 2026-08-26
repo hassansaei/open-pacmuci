@@ -77,6 +77,14 @@ MIN_VALLEY_COVERAGE_FRACTION = 0.1
 # Half-width of the contig window retained around each prominence peak.
 PEAK_CLUSTER_HALF_WIDTH = 5
 
+# Read-length histogram (ONT amplicon): recover a weak longer allele that
+# ladder prominence misses, without trusting sparse long-tail idxstats alone.
+LENGTH_BIN_SIZE_BP = 50
+MIN_LENGTH_PEAK_READS = 40
+MIN_LENGTH_SEPARATION_BP = MIN_PEAK_SEPARATION * 60
+MIN_LENGTH_SECONDARY_FRACTION = 0.02
+LENGTH_TO_CONTIG_SEARCH_RADIUS = 5
+
 
 def parse_idxstats(idxstats_output: str) -> dict[int, int]:
     """Parse samtools idxstats output into repeat_count -> read_count mapping.
@@ -309,6 +317,197 @@ def _valley_reads_between(counts: dict[int, int], pos_a: int, pos_b: int) -> int
     lo, hi = sorted((pos_a, pos_b))
     between = [counts[c] for c in counts if lo < c < hi]
     return min(between) if between else 0
+
+
+def _iter_primary_mapped(bam_path: Path):
+    """Yield ``(contig_name, query_length)`` for primary mapped alignments."""
+    # Skip unmapped (0x4), secondary (0x100), supplementary (0x800).
+    for line in run_tool_iter(["samtools", "view", "-F", "2308", str(bam_path)]):
+        parts = line.split("\t")
+        if len(parts) < 10:
+            continue
+        rname = parts[2]
+        if rname == "*":
+            continue
+        yield rname, len(parts[9])
+
+
+def _read_length_histograms(
+    bam_path: Path,
+    bin_size: int = LENGTH_BIN_SIZE_BP,
+) -> tuple[dict[int, int], dict[int, dict[int, int]]]:
+    """Bin primary-mapped query lengths and per-bin contig votes.
+
+    Returns:
+        ``(bin_counts, bin_contig_votes)`` where keys are bin starts in bp and
+        contig votes map canonical repeat index -> read count.
+    """
+    bin_counts: dict[int, int] = {}
+    bin_contig_votes: dict[int, dict[int, int]] = {}
+    for rname, qlen in _iter_primary_mapped(bam_path):
+        b = (qlen // bin_size) * bin_size
+        bin_counts[b] = bin_counts.get(b, 0) + 1
+        match = re.search(r"_(\d+)$", rname)
+        if not match:
+            continue
+        canon = int(match.group(1))
+        votes = bin_contig_votes.setdefault(b, {})
+        votes[canon] = votes.get(canon, 0) + 1
+    return bin_counts, bin_contig_votes
+
+
+def _find_read_length_peaks(
+    bin_counts: dict[int, int],
+    min_reads: int = MIN_LENGTH_PEAK_READS,
+    min_separation_bp: int = MIN_LENGTH_SEPARATION_BP,
+    min_height_fraction: float = MIN_LENGTH_SECONDARY_FRACTION,
+) -> list[dict]:
+    """Return up to two amplicon-length peaks (primary, optional longer secondary)."""
+    if not bin_counts:
+        return []
+
+    items = sorted(bin_counts.items())
+    peaks: list[dict] = []
+    for i, (pos, reads) in enumerate(items):
+        if reads < min_reads:
+            continue
+        left = items[i - 1][1] if i > 0 else -1
+        right = items[i + 1][1] if i + 1 < len(items) else -1
+        if reads >= left and reads >= right:
+            peaks.append({"pos": pos, "reads": reads})
+
+    if not peaks:
+        return []
+
+    peaks.sort(key=lambda p: (-p["reads"], -p["pos"]))
+    primary = peaks[0]
+    result = [primary]
+    for cand in peaks[1:]:
+        if cand["pos"] < primary["pos"] + min_separation_bp:
+            continue
+        if cand["reads"] < min_height_fraction * primary["reads"]:
+            continue
+        result.append(cand)
+        break
+    return result
+
+
+def _canonical_from_length_peak(
+    peak_bp: int,
+    bin_contig_votes: dict[int, dict[int, int]],
+    counts: dict[int, int],
+    primary_peak_bp: int | None = None,
+    primary_canonical: int | None = None,
+    bin_size: int = LENGTH_BIN_SIZE_BP,
+    min_coverage: int = 10,
+) -> int | None:
+    """Map an amplicon-length peak to a ladder canonical contig index.
+
+    Prefer flank calibration from the primary length peak when available,
+    then pick the busiest idxstats contig near the expected index.  Fall
+    back to majority vote among reads in nearby length bins.
+    """
+    expected: int | None = None
+    if primary_peak_bp is not None and primary_canonical is not None:
+        primary_units = primary_canonical + PRE_AFTER_REPEAT_COUNT
+        flank_total = primary_peak_bp - primary_units * 60
+        expected_units = round((peak_bp - flank_total) / 60)
+        expected = expected_units - PRE_AFTER_REPEAT_COUNT
+
+    best: int | None = None
+    best_reads = -1
+    if expected is not None:
+        lo = expected - LENGTH_TO_CONTIG_SEARCH_RADIUS
+        hi = expected + LENGTH_TO_CONTIG_SEARCH_RADIUS
+        for n in range(lo, hi + 1):
+            r = counts.get(n, 0)
+            if r >= min_coverage and r > best_reads:
+                best = n
+                best_reads = r
+
+    votes: dict[int, int] = {}
+    for delta in range(-2, 3):
+        b = peak_bp + delta * bin_size
+        for canon, n in bin_contig_votes.get(b, {}).items():
+            votes[canon] = votes.get(canon, 0) + n
+    voted = max(votes, key=lambda c: votes[c]) if votes else None
+
+    if best is not None:
+        return best
+    if voted is not None and counts.get(voted, 0) >= min_coverage:
+        return voted
+    return None
+
+
+def _find_clusters_from_read_lengths(
+    bam_path: Path,
+    counts: dict[int, int],
+    min_coverage: int,
+) -> list[dict] | None:
+    """Build two allele clusters from BAM read-length maxima when possible.
+
+    Used to recover a PCR-biased longer ONT allele that fails ladder
+    prominence height/valley gates.  Returns ``None`` unless two well
+    separated length peaks map to distinct ladder contigs.
+    """
+    bin_counts, bin_votes = _read_length_histograms(bam_path)
+    peaks = _find_read_length_peaks(bin_counts)
+    if len(peaks) < 2:
+        return None
+
+    primary_len = peaks[0]
+    secondary_len = peaks[1]
+
+    primary_canon = _canonical_from_length_peak(
+        primary_len["pos"],
+        bin_votes,
+        counts,
+        min_coverage=min_coverage,
+    )
+    if primary_canon is None:
+        return None
+
+    secondary_canon = _canonical_from_length_peak(
+        secondary_len["pos"],
+        bin_votes,
+        counts,
+        primary_peak_bp=primary_len["pos"],
+        primary_canonical=primary_canon,
+        min_coverage=min_coverage,
+    )
+    if secondary_canon is None:
+        return None
+    if abs(secondary_canon - primary_canon) < MIN_PEAK_SEPARATION:
+        return None
+    # Longer allele only (short fragment noise must not become allele_2).
+    if secondary_canon < primary_canon + MIN_PEAK_SEPARATION:
+        return None
+
+    def _window(peak_pos: int) -> dict:
+        half = PEAK_CLUSTER_HALF_WIDTH
+        half = max(2, min(half, abs(secondary_canon - primary_canon) // 2))
+        contigs = sorted(
+            (c, counts[c])
+            for c in counts
+            if abs(c - peak_pos) <= half and counts[c] >= min_coverage
+        )
+        if not contigs:
+            contigs = [(peak_pos, counts.get(peak_pos, 0))]
+        return _make_cluster_from_contigs(contigs, center=peak_pos)
+
+    clusters = [_window(primary_canon), _window(secondary_canon)]
+    clusters.sort(key=lambda x: x["total_reads"], reverse=True)
+    logger.info(
+        "Read-length peaks: %d bp -> contig_%d (%d reads in bin), "
+        "%d bp -> contig_%d (%d reads in bin)",
+        primary_len["pos"],
+        primary_canon,
+        primary_len["reads"],
+        secondary_len["pos"],
+        secondary_canon,
+        secondary_len["reads"],
+    )
+    return clusters
 
 
 def _find_peaks_by_prominence(
@@ -567,7 +766,11 @@ def detect_alleles(
        coverage-weighted indel-valley splitting (close alleles).
     4. If the ladder is a wide ONT-like smear (span > ``MAX_CLUSTER_SPAN``),
        switch to read-count prominence peaks with a secondary-height and
-       valley-depth filter.  No credible second peak → same-length.
+       valley-depth filter.
+    5. If still a single cluster and a BAM is available, try recovering a
+       longer secondary allele from primary-mapped read-length maxima
+       (rescues PCR-biased ONT long alleles without trusting sparse
+       ladder long-tails).
 
     If *bam_path* is provided, the best contig within each cluster is refined
     using alignment scores (AS), trusted only within ±1 of the cluster center.
@@ -626,6 +829,16 @@ def detect_alleles(
             peak_clusters = _find_peaks_by_prominence(int_counts, min_coverage)
             if len(peak_clusters) >= 2:
                 clusters = peak_clusters
+
+    # ONT PCR bias: a real longer allele can sit just below ladder prominence
+    # gates.  Recover it from BAM read-length maxima (PacMUCI-style), which
+    # do not invent sparse ~150-repeat ladder tails.
+    if len(clusters) == 1 and bam_path is not None:
+        length_clusters = _find_clusters_from_read_lengths(
+            bam_path, int_counts, min_coverage
+        )
+        if length_clusters is not None:
+            clusters = length_clusters
 
     if not clusters:
         raise ValueError("Allele detection produced no clusters.")
