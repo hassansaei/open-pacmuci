@@ -59,6 +59,24 @@ logger = logging.getLogger(__name__)
 # so total allele length = N + PRE_AFTER_REPEAT_COUNT.
 PRE_AFTER_REPEAT_COUNT = 9
 
+# ONT amplicon ladder mappings often put >= min_coverage reads on every
+# contig, merging the whole ladder into one gap-cluster.  Spans wider than
+# this switch from indel-valley splitting to read-count peak finding.
+MAX_CLUSTER_SPAN = 40
+
+# Minimum distance (canonical repeats) between two allele peaks.
+MIN_PEAK_SEPARATION = 10
+
+# Secondary peak must reach this fraction of the primary peak height.
+MIN_SECONDARY_HEIGHT_FRACTION = 0.05
+
+# Indel-valley contigs must have at least this fraction of the cluster's
+# max per-contig read count (ignores sparse long-tail false valleys).
+MIN_VALLEY_COVERAGE_FRACTION = 0.1
+
+# Half-width of the contig window retained around each prominence peak.
+PEAK_CLUSTER_HALF_WIDTH = 5
+
 
 def parse_idxstats(idxstats_output: str) -> dict[int, int]:
     """Parse samtools idxstats output into repeat_count -> read_count mapping.
@@ -231,9 +249,146 @@ def _find_clusters(
     return result
 
 
+def _cluster_span(cluster: dict) -> int:
+    """Return the contig-index span of a cluster (max - min)."""
+    contigs = [c for c, _ in cluster["contigs"]]
+    if not contigs:
+        return 0
+    return contigs[-1] - contigs[0]
+
+
+def _make_cluster_from_contigs(contigs: list[tuple[int, int]], center: int | None = None) -> dict:
+    """Build a cluster dict from (repeat_count, reads) pairs."""
+    total = sum(r for _, r in contigs)
+    if center is None:
+        center = round(sum(c * r for c, r in contigs) / total) if total else 0
+    return {"center": center, "total_reads": total, "contigs": contigs}
+
+
+def _compute_prominence(items: list[tuple[int, int]], peak_idx: int) -> float:
+    """Topographic prominence of ``items[peak_idx]`` in a sorted series."""
+    peak_reads = items[peak_idx][1]
+
+    def _side_prominence(indices: range) -> float:
+        min_along = peak_reads
+        for j in indices:
+            min_along = min(min_along, items[j][1])
+            if items[j][1] > peak_reads:
+                return float(peak_reads - min_along)
+        side_min = min(items[j][1] for j in indices) if indices else peak_reads
+        return float(peak_reads - side_min)
+
+    left = _side_prominence(range(peak_idx - 1, -1, -1))
+    right = _side_prominence(range(peak_idx + 1, len(items)))
+    return min(left, right)
+
+
+def _valley_reads_between(counts: dict[int, int], pos_a: int, pos_b: int) -> int:
+    """Minimum read count strictly between two contig positions."""
+    lo, hi = sorted((pos_a, pos_b))
+    between = [counts[c] for c in counts if lo < c < hi]
+    return min(between) if between else 0
+
+
+def _find_peaks_by_prominence(
+    counts: dict[int, int],
+    min_coverage: int,
+    min_separation: int = MIN_PEAK_SEPARATION,
+    min_height_fraction: float = MIN_SECONDARY_HEIGHT_FRACTION,
+) -> list[dict]:
+    """Find up to two allele clusters from read-count local maxima.
+
+    Primary peak = highest prominence local maximum.  Secondary peak must be
+    at least ``min_separation`` contigs away, reach ``min_height_fraction`` of
+    the primary height, and sit behind a clear valley (valley below half the
+    secondary height).  Otherwise a single cluster is returned (same-length).
+
+    Each cluster is a tight window around the peak contig, not a ladder-wide
+    smear.
+    """
+    items = sorted((k, v) for k, v in counts.items() if v >= min_coverage)
+    if not items:
+        return []
+
+    peaks: list[dict] = []
+    for i, (pos, reads) in enumerate(items):
+        left = items[i - 1][1] if i > 0 else -1
+        right = items[i + 1][1] if i + 1 < len(items) else -1
+        if reads >= left and reads >= right:
+            peaks.append(
+                {
+                    "pos": pos,
+                    "reads": reads,
+                    "prominence": _compute_prominence(items, i),
+                }
+            )
+
+    if not peaks:
+        # Flat series: fall back to global maximum
+        pos, reads = max(items, key=lambda x: x[1])
+        peaks = [{"pos": pos, "reads": reads, "prominence": float(reads)}]
+
+    peaks.sort(key=lambda p: (-p["prominence"], -p["reads"]))
+    primary = peaks[0]
+
+    def _accept(cand: dict, height_fraction: float) -> bool:
+        if abs(cand["pos"] - primary["pos"]) < min_separation:
+            return False
+        if cand["reads"] < height_fraction * primary["reads"]:
+            return False
+        valley = _valley_reads_between(counts, primary["pos"], cand["pos"])
+        # Reject shoulders: valley must drop below half the secondary height
+        return valley <= 0.5 * cand["reads"]
+
+    # Only accept a longer secondary allele.  Short-contig noise ridges are
+    # ubiquitous on ONT amplicons (PCR / partial products) and must not become
+    # allele_2.  If no longer peak qualifies, report same-length.
+    secondary: dict | None = None
+    for cand in peaks[1:]:
+        if cand["pos"] < primary["pos"] + min_separation:
+            continue
+        if _accept(cand, min_height_fraction):
+            secondary = cand
+            break
+
+    def _window_cluster(peak_pos: int) -> dict:
+        half = PEAK_CLUSTER_HALF_WIDTH
+        if secondary is not None:
+            half = max(2, min(half, abs(secondary["pos"] - primary["pos"]) // 2))
+        contigs = sorted(
+            (c, counts[c])
+            for c in counts
+            if abs(c - peak_pos) <= half and counts[c] >= min_coverage
+        )
+        if not contigs:
+            contigs = [(peak_pos, counts.get(peak_pos, 0))]
+        return _make_cluster_from_contigs(contigs, center=peak_pos)
+
+    clusters = [_window_cluster(primary["pos"])]
+    if secondary is not None:
+        clusters.append(_window_cluster(secondary["pos"]))
+        clusters.sort(key=lambda x: x["total_reads"], reverse=True)
+        logger.info(
+            "Prominence peaks: contig_%d (%d reads) and contig_%d (%d reads)",
+            primary["pos"],
+            primary["reads"],
+            secondary["pos"],
+            secondary["reads"],
+        )
+    else:
+        logger.info(
+            "Prominence peaks: single peak contig_%d (%d reads); treating as same-length",
+            primary["pos"],
+            primary["reads"],
+        )
+
+    return clusters
+
+
 def _split_cluster_by_indel(
     bam_path: Path,
     cluster: dict,
+    min_valley_coverage_fraction: float = MIN_VALLEY_COVERAGE_FRACTION,
 ) -> list[dict] | None:
     """Attempt to split a single cluster into two alleles using indel valleys.
 
@@ -242,6 +397,11 @@ def _split_cluster_by_indel(
     contig have near-zero indels.  By finding the two local minima in
     per-contig mean indel length, we can resolve close alleles that
     gap-based clustering merges into one cluster.
+
+    Valleys are ignored when their contig has fewer than
+    ``min_valley_coverage_fraction`` of the cluster's busiest contig.  This
+    blocks ONT long-tail false valleys that otherwise invent a ~150-repeat
+    second allele.
 
     Returns two sub-clusters if a clear split is found, or None if the
     cluster is genuinely homozygous (single indel valley).
@@ -271,26 +431,35 @@ def _split_cluster_by_indel(
         contig_stats[c]["count"] += 1
 
     # Build mean-indel series (only contigs with reads)
-    indel_series: list[tuple[int, float]] = []
+    indel_series: list[tuple[int, float, int]] = []
     for c in sorted(contig_stats):
         n = contig_stats[c]["count"]
         if n == 0:
             continue
-        indel_series.append((c, contig_stats[c]["indel_sum"] / n))
+        indel_series.append((c, contig_stats[c]["indel_sum"] / n, n))
 
     if len(indel_series) < 3:
         return None
 
-    # Find local minima (valleys) in mean indel
-    valleys: list[tuple[int, float]] = []
+    max_reads = max(n for _, _, n in indel_series)
+    min_valley_reads = max(1, int(min_valley_coverage_fraction * max_reads))
+
+    # Find local minima (valleys) in mean indel, coverage-filtered
+    valleys: list[tuple[int, float, int]] = []
     for i in range(len(indel_series)):
-        c, val = indel_series[i]
+        c, val, n = indel_series[i]
+        if n < min_valley_reads:
+            continue
         left = indel_series[i - 1][1] if i > 0 else float("inf")
         right = indel_series[i + 1][1] if i < len(indel_series) - 1 else float("inf")
         if val <= left and val <= right:
-            valleys.append((c, val))
+            valleys.append((c, val, n))
 
-    logger.debug("Indel valley splitting: found %d valleys", len(valleys))
+    logger.debug(
+        "Indel valley splitting: %d coverage-qualified valleys (min reads %d)",
+        len(valleys),
+        min_valley_reads,
+    )
     if len(valleys) < 2:
         return None
 
@@ -314,38 +483,44 @@ def _split_cluster_by_indel(
     if not sub1 or not sub2:
         return None
 
-    def _make_sub_cluster(contigs: list[tuple[int, int]]) -> dict:
-        total = sum(r for _, r in contigs)
-        center = sum(c * r for c, r in contigs) / total
-        return {"center": round(center), "total_reads": total, "contigs": contigs}
-
-    return [_make_sub_cluster(sub1), _make_sub_cluster(sub2)]
+    return [_make_cluster_from_contigs(sub1), _make_cluster_from_contigs(sub2)]
 
 
 def _build_allele_info(cluster: dict, best_contig: str | None = None) -> dict:
     """Build allele info dict from a cluster.
 
+    ``contig_name`` always matches ``canonical_repeats`` so remapping and
+    Clair3 use the same ladder length that the report advertises.
+
     Args:
         cluster: Cluster dict from _find_clusters.
         best_contig: Contig name selected by refine_peak_contig.
             If None, falls back to the weighted center.
+            Trusted only when within ±1 of the cluster center; otherwise
+            discarded (ONT AS can peak far from the true length).
     """
     canonical = cluster["center"]
-    contig_name = best_contig if best_contig is not None else f"contig_{canonical}"
 
     # When refine_peak_contig has identified a specific best contig,
-    # derive canonical_repeats from its name rather than the cluster
-    # center.  ONT reads produce wider distributions that can shift
-    # the weighted center by ±1 vs the AS-refined best contig.
-    # However, at longer allele lengths the AS metric itself can be
-    # unreliable for ONT (off by 2+), so only trust the refinement
-    # when it agrees with the cluster center within ±1.
+    # adopt it only if it agrees with the cluster center within ±1.
+    # ONT AS can prefer a much longer contig; remapping to that contig
+    # while reporting the center length produces wrong-length consensus.
     if best_contig is not None:
         match = re.search(r"_(\d+)$", best_contig)
         if match:
             refined_canonical = int(match.group(1))
             if abs(refined_canonical - canonical) <= 1:
                 canonical = refined_canonical
+            else:
+                logger.warning(
+                    "Discarding AS-refined %s (differs from cluster center "
+                    "%d by >1); remapping will use contig_%d",
+                    best_contig,
+                    canonical,
+                    canonical,
+                )
+
+    contig_name = f"contig_{canonical}"
 
     return {
         "length": canonical + PRE_AFTER_REPEAT_COUNT,
@@ -363,13 +538,18 @@ def detect_alleles(
 ) -> dict:
     """Detect allele lengths from read count distribution across ladder contigs.
 
-    Finds two peak clusters in the read distribution. Each cluster represents
-    one allele. Reports the total allele length (canonical repeats + 9 fixed
-    pre/after repeats) and the contig names needed for downstream processing.
+    Strategy (in order):
+
+    1. Gap-cluster contigs with ``>= min_coverage`` reads.
+    2. If clusters are narrow and separated (typical HiFi), use them.
+    3. If a single cluster is narrow and a BAM is available, try
+       coverage-weighted indel-valley splitting (close alleles).
+    4. If the ladder is a wide ONT-like smear (span > ``MAX_CLUSTER_SPAN``),
+       switch to read-count prominence peaks with a secondary-height and
+       valley-depth filter.  No credible second peak → same-length.
 
     If *bam_path* is provided, the best contig within each cluster is refined
-    using alignment scores (AS) and indel lengths from the BAM.  Without a
-    BAM, the weighted center of the cluster is used as a fallback.
+    using alignment scores (AS), trusted only within ±1 of the cluster center.
 
     Args:
         counts: Canonical repeat count -> mapped reads mapping from
@@ -395,7 +575,7 @@ def detect_alleles(
     int_counts = {k: v for k, v in counts.items() if isinstance(k, int)}
 
     clusters = _find_clusters(int_counts, min_coverage)
-    logger.info("Detected %d peak(s) from %d contigs", len(clusters), len(int_counts))
+    logger.info("Detected %d gap-cluster(s) from %d contigs", len(clusters), len(int_counts))
 
     if not clusters:
         max_observed = max(int_counts.values()) if int_counts else 0
@@ -404,7 +584,31 @@ def detect_alleles(
             f"Max observed: {max_observed} reads."
         )
 
-    # Refine peak contig selection using alignment quality if BAM available
+    wide_smear = any(_cluster_span(c) > MAX_CLUSTER_SPAN for c in clusters)
+
+    if wide_smear:
+        # ONT amplicon: residual coverage across the whole ladder.  Do not
+        # trust indel-valley splits (they invent ~150-repeat alleles).
+        logger.info(
+            "Wide ladder smear detected (span > %d); using prominence peaks",
+            MAX_CLUSTER_SPAN,
+        )
+        clusters = _find_peaks_by_prominence(int_counts, min_coverage)
+    elif len(clusters) == 1 and bam_path is not None:
+        # Narrow single cluster: try coverage-weighted indel valleys (HiFi
+        # close alleles).  Fall back to prominence if valleys are weak.
+        sub_clusters = _split_cluster_by_indel(bam_path, clusters[0])
+        if sub_clusters is not None:
+            clusters = sub_clusters
+            clusters.sort(key=lambda x: x["total_reads"], reverse=True)
+        elif _cluster_span(clusters[0]) >= MIN_PEAK_SEPARATION:
+            peak_clusters = _find_peaks_by_prominence(int_counts, min_coverage)
+            if len(peak_clusters) >= 2:
+                clusters = peak_clusters
+
+    if not clusters:
+        raise ValueError("Allele detection produced no clusters.")
+
     def _get_best_contig(cluster: dict) -> str | None:
         if bam_path is None:
             return None
@@ -412,13 +616,6 @@ def detect_alleles(
         refined = refine_peak_contig(bam_path, contig_names)
         best: str = refined["best_contig"]
         return best
-
-    # If only one cluster found but BAM is available, try indel-valley splitting
-    if len(clusters) == 1 and bam_path is not None:
-        sub_clusters = _split_cluster_by_indel(bam_path, clusters[0])
-        if sub_clusters is not None:
-            clusters = sub_clusters
-            clusters.sort(key=lambda x: x["total_reads"], reverse=True)
 
     allele_1 = _build_allele_info(clusters[0], _get_best_contig(clusters[0]))
 
@@ -431,6 +628,21 @@ def detect_alleles(
         }
 
     allele_2 = _build_allele_info(clusters[1], _get_best_contig(clusters[1]))
+
+    # Drop a secondary allele whose peak support is negligible vs allele_1
+    # (applies when gap clustering left a tiny long-tail remnant).
+    if allele_1["reads"] > 0 and allele_2["reads"] < MIN_SECONDARY_HEIGHT_FRACTION * allele_1["reads"]:
+        logger.info(
+            "Dropping allele_2 (%d reads < %.0f%% of allele_1); same-length",
+            allele_2["reads"],
+            100 * MIN_SECONDARY_HEIGHT_FRACTION,
+        )
+        return {
+            "allele_1": allele_1,
+            "allele_2": {**allele_1},
+            "homozygous": False,
+            "same_length": True,
+        }
 
     if allele_1["length"] == allele_2["length"]:
         allele_1["reads"] += allele_2["reads"]

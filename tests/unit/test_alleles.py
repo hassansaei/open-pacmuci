@@ -12,6 +12,7 @@ import pytest
 from open_pacmuci.alleles import (
     PRE_AFTER_REPEAT_COUNT,
     _build_allele_info,
+    _find_peaks_by_prominence,
     _split_cluster_by_indel,
     detect_alleles,
     parse_idxstats,
@@ -152,6 +153,88 @@ class TestDetectAlleles:
         assert isinstance(a1["cluster_contigs"], list)
         assert "canonical_repeats" in a1
         assert a1["length"] == a1["canonical_repeats"] + PRE_AFTER_REPEAT_COUNT
+
+
+class TestProminencePeaks:
+    """Tests for ONT-style prominence peak finding."""
+
+    def test_ont_smear_does_not_invent_length_150_allele(self):
+        """Wide ladder smear with one real peak → same_length, not ~150.
+
+        Simulates ONT amplicon idxstats: every contig has residual coverage,
+        one strong short peak, and a flat long-tail floor.  The old
+        indel-valley path invented allele_2 near contig_150.
+        """
+        counts = {n: 80 for n in range(1, 151)}
+        # Strong short-allele peak
+        for n, r in [(32, 5000), (33, 9000), (34, 10000), (35, 9500), (36, 6000)]:
+            counts[n] = r
+        # Flat long-tail (must not become allele_2)
+        for n in range(130, 151):
+            counts[n] = 90
+
+        result = detect_alleles(counts, min_coverage=10)
+        assert result["same_length"] is True
+        assert result["allele_1"]["canonical_repeats"] == 34
+        assert result["allele_1"]["contig_name"] == "contig_34"
+        assert result["allele_2"]["canonical_repeats"] == 34
+
+    def test_two_well_separated_peaks_both_kept(self):
+        """Two strong peaks with a deep valley → heterozygous call."""
+        counts = {n: 20 for n in range(1, 121)}
+        for n, r in [(39, 800), (40, 1200), (41, 900)]:
+            counts[n] = r
+        for n, r in [(79, 500), (80, 700), (81, 450)]:
+            counts[n] = r
+        # Deep valley between peaks
+        for n in range(50, 70):
+            counts[n] = 15
+
+        result = detect_alleles(counts, min_coverage=10)
+        assert result["same_length"] is False
+        lengths = sorted(
+            [
+                result["allele_1"]["canonical_repeats"],
+                result["allele_2"]["canonical_repeats"],
+            ]
+        )
+        assert lengths == [40, 80]
+
+    def test_find_peaks_prefers_longer_secondary(self):
+        """Short-contig noise ridge is not chosen over a longer real peak."""
+        counts = {n: 50 for n in range(1, 101)}
+        # Primary
+        counts[60] = 2000
+        counts[59] = 1500
+        counts[61] = 1500
+        # Short noise ridge (must lose to longer peak)
+        counts[10] = 900
+        counts[9] = 800
+        counts[11] = 800
+        # Longer secondary with a clear valley
+        counts[85] = 400
+        counts[84] = 300
+        counts[86] = 300
+        for n in range(70, 80):
+            counts[n] = 40
+
+        clusters = _find_peaks_by_prominence(counts, min_coverage=10)
+        assert len(clusters) == 2
+        centers = sorted(c["center"] for c in clusters)
+        assert centers == [60, 85]
+
+    def test_short_noise_ridge_alone_yields_same_length(self):
+        """Primary + short noise only → same_length (no longer secondary)."""
+        counts = {n: 40 for n in range(1, 101)}
+        counts[72] = 2000
+        counts[71] = 1800
+        counts[73] = 1800
+        counts[6] = 1200
+        counts[5] = 1100
+        counts[7] = 1100
+        result = detect_alleles(counts, min_coverage=10)
+        assert result["same_length"] is True
+        assert result["allele_1"]["canonical_repeats"] == 72
 
 
 # ---------------------------------------------------------------------------
@@ -359,7 +442,9 @@ class TestBuildAlleleInfo:
 
         For long ONT alleles (>80 repeats), the AS metric can peak at a
         contig 2+ positions away from the true length.  In that case the
-        cluster center (off by at most 1) is more reliable.
+        cluster center (off by at most 1) is more reliable.  contig_name
+        must follow the chosen length so remapping does not use the
+        discarded AS peak.
         """
         # ONT 80/100 case: center=72 (true=71), AS picks contig_69 (off by -2)
         cluster = self._cluster(
@@ -377,10 +462,26 @@ class TestBuildAlleleInfo:
             ],
         )
         info = _build_allele_info(cluster, best_contig="contig_69")
-        assert info["contig_name"] == "contig_69"
-        # canonical_repeats should fall back to center (72), not use 69
         assert info["canonical_repeats"] == 72
         assert info["length"] == 72 + PRE_AFTER_REPEAT_COUNT
+        assert info["contig_name"] == "contig_72"
+
+    def test_ont_as_peak_far_from_center_keeps_contig_aligned(self):
+        """ONT smear: AS picks contig_73 while center is ~34; remap contig_34.
+
+        Reproduces barcode18/20 allele_1 failure mode where reported length
+        and Clair3 reference disagreed.
+        """
+        cluster = self._cluster(
+            34,
+            100000,
+            contigs=[(n, 100) for n in range(1, 123)],
+        )
+        info = _build_allele_info(cluster, best_contig="contig_73")
+        assert info["canonical_repeats"] == 34
+        assert info["length"] == 34 + PRE_AFTER_REPEAT_COUNT
+        assert info["contig_name"] == "contig_34"
+        assert info["contig_name"] == f"contig_{info['canonical_repeats']}"
 
 
 class TestSameLengthDetection:
