@@ -27,7 +27,7 @@ WORKDIR /app
 # Install from the build context (local fork / working tree), not PyPI.
 # Do not rm /app here: WORKDIR is root-owned and $MAMBA_USER cannot delete it.
 # The runtime stage only copies the conda env, so /app is discarded anyway.
-RUN micromamba run -n open-pacmuci-tools pip install --no-cache-dir .
+RUN micromamba run -n open-pacmuci-tools pip install --no-cache-dir ".[report]"
 
 # ============================================================================
 # Runtime stage -- slim image with only the resolved environment
