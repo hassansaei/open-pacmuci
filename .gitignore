@@ -46,6 +46,13 @@ htmlcov/
 # Test data (generated)
 tests/data/generated/
 
+# Local ONT amplicon FASTQs and validation outputs
+ONT/
+
+# Local ONT planning / issue drafts (keep out of git)
+.planning/ONT_AMPLICON_GITHUB_ISSUES.md
+.planning/ont_issue1_validation/
+
 # Git worktrees
 .worktrees/
 
