@@ -24,8 +24,10 @@ COPY --chown=$MAMBA_USER:$MAMBA_USER pyproject.toml README.md /app/
 COPY --chown=$MAMBA_USER:$MAMBA_USER src/ /app/src/
 
 WORKDIR /app
-RUN micromamba run -n open-pacmuci-tools pip install --no-cache-dir . && \
-    rm -rf /app
+# Install from the build context (local fork / working tree), not PyPI.
+# Do not rm /app here: WORKDIR is root-owned and $MAMBA_USER cannot delete it.
+# The runtime stage only copies the conda env, so /app is discarded anyway.
+RUN micromamba run -n open-pacmuci-tools pip install --no-cache-dir .
 
 # ============================================================================
 # Runtime stage -- slim image with only the resolved environment
