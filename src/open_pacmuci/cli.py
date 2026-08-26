@@ -455,7 +455,7 @@ def run(
 
     # Step 5: Classify repeats
     click.echo("Step 5/5: Classifying repeats...")
-    from open_pacmuci.classify import validate_mutations_against_vcf
+    from open_pacmuci.classify import reconcile_shared_frameshifts, validate_mutations_against_vcf
 
     all_results: dict[str, dict] = {}
     for allele_key, fa_path in consensus_paths.items():
@@ -469,9 +469,18 @@ def run(
             result = validate_mutations_against_vcf(result, vcf_variants=vcf_variants)
 
         all_results[allele_key] = result
+
+    # Demote weak duplicate frameshifts shared across alleles (ONT bleed)
+    if len(all_results) >= 2 and not alleles_result.get("same_length"):
+        all_results = reconcile_shared_frameshifts(all_results)
+
+    for allele_key, result in all_results.items():
         click.echo(f"  {allele_key}: {result['structure']}")
         if result.get("allele_confidence") is not None:
             click.echo(f"    confidence: {result['allele_confidence']:.2f}")
+        demoted = result.get("mutations_demoted") or []
+        if demoted:
+            click.echo(f"    demoted shared frameshifts: {len(demoted)}")
 
     # Write combined outputs
     (out / "repeats.json").write_text(json.dumps(all_results, indent=2) + "\n")
@@ -485,6 +494,7 @@ def run(
             k: {
                 "structure": v["structure"],
                 "mutations": v["mutations_detected"],
+                "mutations_demoted": v.get("mutations_demoted", []),
             }
             for k, v in all_results.items()
         },

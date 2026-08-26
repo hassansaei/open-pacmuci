@@ -786,3 +786,125 @@ def validate_mutations_against_vcf(
     )
 
     return result
+
+
+def _frameshift_signature(mutation: dict) -> tuple | None:
+    """Build a comparable signature for a frameshift mutation.
+
+    Returns None for non-frameshift mutations.  Signatures ignore absolute
+    repeat index so the same event can be matched across alleles of different
+    lengths (shared early-VNTR coordinates).
+    """
+    if not mutation.get("frameshift", False):
+        return None
+    if mutation.get("mutation_name"):
+        return (
+            "template",
+            mutation.get("parent_repeat") or mutation.get("closest_type"),
+            mutation["mutation_name"],
+        )
+    diffs = mutation.get("differences") or []
+    indel_parts: list[tuple[str, str, str]] = []
+    for d in diffs:
+        if d.get("type") in ("insertion", "deletion"):
+            indel_parts.append((d["type"], d.get("ref", ""), d.get("alt", "")))
+    if not indel_parts:
+        return None
+    return ("indel", mutation.get("closest_type", "?"), tuple(indel_parts))
+
+
+def reconcile_shared_frameshifts(
+    allele_results: dict[str, dict],
+    qual_ratio: float = 2.0,
+    min_strong_qual: float = 15.0,
+) -> dict[str, dict]:
+    """Demote weak duplicate frameshifts shared across alleles (Issue 5).
+
+    When the same frameshift signature appears on both alleles (common under
+    ONT read bleed), keep the stronger VCF QUAL call and demote the weaker
+    copy unless both are confidently supported.
+
+    Demoted mutations are moved to ``mutations_demoted`` and marked
+    ``allele_private=False`` / ``shared_duplicate=True``.  Kept mutations
+    receive ``allele_private=True`` (unique) or ``shared=True`` (both strong).
+    """
+    keys = [k for k in ("allele_1", "allele_2") if k in allele_results]
+    if len(keys) < 2:
+        for k in keys:
+            for m in allele_results[k].get("mutations_detected", []):
+                if m.get("frameshift"):
+                    m["allele_private"] = True
+        return allele_results
+
+    a1, a2 = keys[0], keys[1]
+    results = {
+        a1: {
+            **allele_results[a1],
+            "mutations_detected": [
+                m.copy() for m in allele_results[a1].get("mutations_detected", [])
+            ],
+            "mutations_demoted": list(allele_results[a1].get("mutations_demoted", [])),
+        },
+        a2: {
+            **allele_results[a2],
+            "mutations_detected": [
+                m.copy() for m in allele_results[a2].get("mutations_detected", [])
+            ],
+            "mutations_demoted": list(allele_results[a2].get("mutations_demoted", [])),
+        },
+    }
+
+    by_sig: dict[tuple, dict[str, dict]] = {}
+    for key in (a1, a2):
+        for mut in results[key]["mutations_detected"]:
+            sig = _frameshift_signature(mut)
+            if sig is None:
+                continue
+            by_sig.setdefault(sig, {})[key] = mut
+
+    for _sig, alleles_hit in by_sig.items():
+        if len(alleles_hit) < 2:
+            for _key, mut in alleles_hit.items():
+                mut["allele_private"] = True
+                mut["shared"] = False
+            continue
+
+        q1 = float(alleles_hit[a1].get("vcf_qual") or 0.0)
+        q2 = float(alleles_hit[a2].get("vcf_qual") or 0.0)
+        both_strong = q1 >= min_strong_qual and q2 >= min_strong_qual
+        ratio_ok = (
+            min(q1, q2) > 0 and max(q1, q2) / max(min(q1, q2), 1e-9) < qual_ratio
+        )
+
+        if both_strong and ratio_ok:
+            for key in (a1, a2):
+                alleles_hit[key]["allele_private"] = False
+                alleles_hit[key]["shared"] = True
+            continue
+
+        keep_key, drop_key = (a1, a2) if q1 >= q2 else (a2, a1)
+        alleles_hit[keep_key]["allele_private"] = True
+        alleles_hit[keep_key]["shared"] = False
+        weak = alleles_hit[drop_key]
+        weak["allele_private"] = False
+        weak["shared_duplicate"] = True
+        weak["shared"] = True
+        results[drop_key]["mutations_detected"] = [
+            m for m in results[drop_key]["mutations_detected"] if m is not weak
+        ]
+        results[drop_key]["mutations_demoted"].append(weak)
+        logger.info(
+            "Demoted shared frameshift on %s (QUAL=%.2f) in favor of %s (QUAL=%.2f)",
+            drop_key,
+            float(weak.get("vcf_qual") or 0.0),
+            keep_key,
+            float(alleles_hit[keep_key].get("vcf_qual") or 0.0),
+        )
+
+    for key in (a1, a2):
+        for mut in results[key]["mutations_detected"]:
+            if mut.get("frameshift") and "allele_private" not in mut:
+                mut["allele_private"] = True
+                mut["shared"] = False
+
+    return results

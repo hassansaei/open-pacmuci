@@ -14,6 +14,7 @@ from open_pacmuci.classify import (
     classify_repeat,
     classify_sequence,
     edit_distance,
+    reconcile_shared_frameshifts,
     validate_mutations_against_vcf,
 )
 from open_pacmuci.config import load_repeat_dictionary
@@ -612,3 +613,63 @@ class TestComputeClassificationSummary:
         assert result["exact_match_pct"] == 100.0
         # Structure should be two space-separated labels
         assert result["structure"] == "X X"
+
+
+class TestReconcileSharedFrameshifts:
+    """Tests for cross-allele frameshift demotion (Issue 5)."""
+
+    def _allele(self, qual: float, frameshift: bool = True) -> dict:
+        mut = {
+            "repeat_index": 6,
+            "closest_type": "C",
+            "frameshift": frameshift,
+            "differences": [{"pos": 1, "ref": "", "alt": "A", "type": "insertion"}],
+            "vcf_qual": qual,
+            "vcf_support": True,
+        }
+        return {
+            "structure": "1 2 3 4 5 Cm X",
+            "mutations_detected": [mut],
+            "repeats": [],
+            "allele_confidence": 1.0,
+        }
+
+    def test_demotes_weak_duplicate(self):
+        """Weaker QUAL shared frameshift is demoted; stronger kept private."""
+        results = {
+            "allele_1": self._allele(8.59),
+            "allele_2": self._allele(37.78),
+        }
+        out = reconcile_shared_frameshifts(results)
+        assert len(out["allele_2"]["mutations_detected"]) == 1
+        assert out["allele_2"]["mutations_detected"][0]["allele_private"] is True
+        assert len(out["allele_1"]["mutations_detected"]) == 0
+        assert len(out["allele_1"]["mutations_demoted"]) == 1
+        assert out["allele_1"]["mutations_demoted"][0]["shared_duplicate"] is True
+
+    def test_keeps_both_when_both_strong(self):
+        """Both alleles keep the call when QUAL is strong on each."""
+        results = {
+            "allele_1": self._allele(30.0),
+            "allele_2": self._allele(32.0),
+        }
+        out = reconcile_shared_frameshifts(results)
+        assert len(out["allele_1"]["mutations_detected"]) == 1
+        assert len(out["allele_2"]["mutations_detected"]) == 1
+        assert out["allele_1"]["mutations_detected"][0]["shared"] is True
+        assert out["allele_2"]["mutations_detected"][0]["shared"] is True
+
+    def test_unique_frameshift_marked_private(self):
+        """Frameshift on only one allele is allele_private."""
+        results = {
+            "allele_1": self._allele(20.0),
+            "allele_2": {
+                "structure": "1 2 3 4 5 C X",
+                "mutations_detected": [],
+                "repeats": [],
+                "allele_confidence": 1.0,
+            },
+        }
+        out = reconcile_shared_frameshifts(results)
+        assert out["allele_1"]["mutations_detected"][0]["allele_private"] is True
+        assert out["allele_1"]["mutations_detected"][0]["shared"] is False
