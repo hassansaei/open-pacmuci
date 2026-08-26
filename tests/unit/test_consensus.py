@@ -5,7 +5,12 @@ from __future__ import annotations
 from pathlib import Path
 from unittest.mock import patch
 
-from open_pacmuci.consensus import build_consensus, build_consensus_per_allele, trim_flanking
+from open_pacmuci.consensus import (
+    build_consensus,
+    build_consensus_per_allele,
+    check_consensus_length,
+    trim_flanking,
+)
 
 
 class TestBuildConsensus:

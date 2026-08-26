@@ -453,6 +453,22 @@ def run(
         ref, vcf_paths, alleles_result, out, repeat_dict=rd
     )
 
+    # QC: consensus unit count vs detected allele length (Issue 7)
+    from open_pacmuci.consensus import check_consensus_length
+
+    consensus_qc: dict[str, dict] = {}
+    for allele_key, fa_path in consensus_paths.items():
+        expected = alleles_result[allele_key]["length"]
+        qc = check_consensus_length(fa_path, expected_units=expected)
+        consensus_qc[allele_key] = qc
+        if not qc["passed"]:
+            click.echo(
+                f"  WARNING: {allele_key} consensus length QC failed "
+                f"(expected {qc['expected_units']} units, "
+                f"observed {qc['observed_units']}, delta={qc['delta']})",
+                err=True,
+            )
+
     # Step 5: Classify repeats
     click.echo("Step 5/5: Classifying repeats...")
     from open_pacmuci.classify import reconcile_shared_frameshifts, validate_mutations_against_vcf
@@ -467,6 +483,16 @@ def run(
         if allele_key in vcf_paths:
             vcf_variants = parse_vcf_variants(vcf_paths[allele_key])
             result = validate_mutations_against_vcf(result, vcf_variants=vcf_variants)
+
+        # Soften confidence when length QC failed
+        qc = consensus_qc.get(allele_key)
+        if qc is not None and not qc["passed"]:
+            result["length_qc"] = qc
+            result["allele_confidence"] = round(
+                float(result.get("allele_confidence") or 0.0) * 0.25, 4
+            )
+        elif qc is not None:
+            result["length_qc"] = qc
 
         all_results[allele_key] = result
 
@@ -495,9 +521,11 @@ def run(
                 "structure": v["structure"],
                 "mutations": v["mutations_detected"],
                 "mutations_demoted": v.get("mutations_demoted", []),
+                "length_qc": v.get("length_qc"),
             }
             for k, v in all_results.items()
         },
+        "consensus_qc": consensus_qc,
         "tool_versions": tool_versions,
         "pipeline_version": __version__,
     }

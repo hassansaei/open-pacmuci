@@ -137,6 +137,39 @@ def trim_flanking(
     return output_path
 
 
+def check_consensus_length(
+    consensus_fasta: Path,
+    expected_units: int,
+    unit_length: int = 60,
+    tolerance: int = 1,
+) -> dict:
+    """Compare trimmed consensus unit count to the detected allele length.
+
+    Args:
+        consensus_fasta: VNTR-only consensus FASTA.
+        expected_units: Expected total repeat units (``allele.length``).
+        unit_length: Repeat unit size in bp (default 60).
+        tolerance: Allowed absolute difference in units (default ±1 for
+            frameshifted alleles).
+
+    Returns:
+        Dict with ``expected_units``, ``observed_units``, ``observed_bp``,
+        ``delta``, and ``passed`` (True if within tolerance).
+    """
+    lines = consensus_fasta.read_text().strip().splitlines()
+    sequence = "".join(line for line in lines if not line.startswith(">"))
+    observed_bp = len(sequence)
+    observed_units = round(observed_bp / unit_length) if unit_length else 0
+    delta = observed_units - expected_units
+    return {
+        "expected_units": expected_units,
+        "observed_units": observed_units,
+        "observed_bp": observed_bp,
+        "delta": delta,
+        "passed": abs(delta) <= tolerance,
+    }
+
+
 def build_consensus_per_allele(
     reference_path: Path,
     vcf_paths: dict[str, Path],
