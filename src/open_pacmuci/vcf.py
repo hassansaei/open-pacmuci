@@ -13,28 +13,37 @@ def filter_vcf(
     output_dir: Path,
     min_qual: float = 0.0,
     min_dp: int = 0,
+    platform: str = "hifi",
+    min_qual_indel: float | None = None,
 ) -> Path:
     """Normalize and filter a VCF file with bcftools.
 
     Runs ``bcftools norm -f <reference>`` followed by
-    ``bcftools view -f PASS`` (with optional quality filters) and indexes
-    the result.
+    ``bcftools view`` with quality filters and indexes the result.
 
     Args:
         vcf_path: Path to input VCF (may be gzipped).
         reference_path: Path to reference FASTA for left-normalisation.
         output_dir: Directory for output files.
-        min_qual: Minimum QUAL score to keep a variant (0 = no filter).
+        min_qual: Minimum QUAL score to keep a PASS variant (0 = no filter).
         min_dp: Accepted for API compatibility but **not applied**.
             Clair3 HiFi places depth in FORMAT/DP (per-sample), not
             INFO/DP.  Filtering on INFO/DP would crash on Clair3 output.
             QUAL-only filtering is used instead since QUAL already
             integrates depth information.
+        platform: Sequencing platform (``hifi`` or ``ont``).
+        min_qual_indel: Optional lower QUAL floor for 1 bp indels.  When
+            ``platform=="ont"`` and this is None, defaults to ``1.0`` so
+            LowQual frameshift candidates are not silently dropped
+            (Issue 6).  HiFi keeps PASS-only filtering unless overridden.
 
     Returns:
         Path to the filtered, indexed VCF (``variants.vcf.gz``).
     """
     output_dir.mkdir(parents=True, exist_ok=True)
+
+    if min_qual_indel is None and platform == "ont":
+        min_qual_indel = 1.0
 
     norm_vcf = output_dir / "normalized.vcf.gz"
     filtered = output_dir / "variants.vcf.gz"
@@ -62,18 +71,26 @@ def filter_vcf(
     # `bcftools view -H | wc -l` but adds an extra subprocess call.
     is_empty = not norm_vcf.exists() or norm_vcf.stat().st_size == 0
 
-    # Build view command with PASS filter and optional quality filters
     view_cmd = [
         "bcftools",
         "view",
-        "-f",
-        "PASS",
     ]
-    # Only add quality filter if VCF has records.
-    # Use QUAL only — Clair3 HiFi uses FORMAT/DP not INFO/DP, and
-    # QUAL already integrates depth/quality information.
-    if not is_empty and min_qual > 0:
-        view_cmd.extend(["-i", f"QUAL>={min_qual}"])
+
+    if not is_empty and (min_qual > 0 or min_qual_indel is not None):
+        # ONT: rescue 1 bp indels at a lower QUAL (incl. LowQual FILTER).
+        # HiFi / default: PASS + QUAL floor only.
+        if min_qual_indel is not None:
+            expr = (
+                f'(FILTER="PASS" && QUAL>={min_qual}) || '
+                f'(abs(strlen(REF)-strlen(ALT))=1 && QUAL>={min_qual_indel})'
+            )
+            view_cmd.extend(["-i", expr])
+        else:
+            view_cmd.extend(["-f", "PASS"])
+            if min_qual > 0:
+                view_cmd.extend(["-i", f"QUAL>={min_qual}"])
+    else:
+        view_cmd.extend(["-f", "PASS"])
 
     view_cmd.extend(
         [

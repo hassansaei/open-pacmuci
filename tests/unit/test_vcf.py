@@ -43,18 +43,53 @@ class TestFilterVcf:
 
     @patch("open_pacmuci.vcf.run_tool")
     def test_view_filters_pass(self, mock_run_tool, tmp_path):
-        """bcftools view uses -f PASS to keep only passing variants."""
+        """bcftools view uses -f PASS to keep only passing variants (HiFi)."""
         mock_run_tool.return_value = ""
         vcf = tmp_path / "raw.vcf.gz"
         ref = tmp_path / "ref.fa"
         out_dir = tmp_path / "filtered"
+        # Non-empty normalized VCF so QUAL filter is applied
+        norm = out_dir / "normalized.vcf.gz"
+        out_dir.mkdir(parents=True, exist_ok=True)
 
-        filter_vcf(vcf, ref, out_dir)
+        def _side_effect(cmd):
+            if cmd[:2] == ["bcftools", "norm"]:
+                norm.write_bytes(b"x" * 100)
+            return ""
+
+        mock_run_tool.side_effect = _side_effect
+
+        filter_vcf(vcf, ref, out_dir, min_qual=5.0, platform="hifi")
 
         view_cmd = mock_run_tool.call_args_list[1][0][0]
         assert "-f" in view_cmd
         f_idx = view_cmd.index("-f")
         assert view_cmd[f_idx + 1] == "PASS"
+
+    @patch("open_pacmuci.vcf.run_tool")
+    def test_ont_rescues_lowqual_one_bp_indels(self, mock_run_tool, tmp_path):
+        """ONT filter keeps 1 bp indels at QUAL>=1 even if LowQual."""
+        mock_run_tool.return_value = ""
+        vcf = tmp_path / "raw.vcf.gz"
+        ref = tmp_path / "ref.fa"
+        out_dir = tmp_path / "filtered"
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        def _side_effect(cmd):
+            if cmd[:2] == ["bcftools", "norm"]:
+                (out_dir / "normalized.vcf.gz").write_bytes(b"x" * 100)
+            return ""
+
+        mock_run_tool.side_effect = _side_effect
+
+        filter_vcf(vcf, ref, out_dir, min_qual=5.0, platform="ont")
+
+        view_cmd = mock_run_tool.call_args_list[1][0][0]
+        assert "-f" not in view_cmd  # expression replaces PASS-only
+        assert "-i" in view_cmd
+        expr = view_cmd[view_cmd.index("-i") + 1]
+        assert "abs(strlen(REF)-strlen(ALT))=1" in expr
+        assert "QUAL>=1" in expr or "QUAL>=1.0" in expr
 
     @patch("open_pacmuci.vcf.run_tool")
     def test_returns_variants_vcf_path(self, mock_run_tool, tmp_path):

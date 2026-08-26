@@ -244,7 +244,14 @@ def disambiguate_same_length_alleles(
         platform=platform,
         threads=threads,
     )
-    filtered_vcf = filter_vcf(raw_vcf, contig_ref, merged_dir, min_qual=min_qual, min_dp=min_dp)
+    filtered_vcf = filter_vcf(
+        raw_vcf,
+        contig_ref,
+        merged_dir,
+        min_qual=min_qual,
+        min_dp=min_dp,
+        platform=platform,
+    )
 
     # Check genotypes
     variants = parse_vcf_genotypes(filtered_vcf)
@@ -413,7 +420,14 @@ def call_variants_per_allele(
         )
 
         # Filter VCF
-        filtered = filter_vcf(vcf, contig_ref, allele_dir, min_qual=min_qual, min_dp=min_dp)
+        filtered = filter_vcf(
+            vcf,
+            contig_ref,
+            allele_dir,
+            min_qual=min_qual,
+            min_dp=min_dp,
+            platform=platform,
+        )
         return allele_key, filtered
 
     # Process both alleles in parallel when they are independent
