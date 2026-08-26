@@ -349,8 +349,32 @@ class TestRefinePeakContig:
 
         result = refine_peak_contig(bam, ["contig_50", "contig_51"])
 
-        # contig_50 read has 50I in CIGAR → mean_indel_bp == 50
         assert result["metrics"]["contig_50"]["mean_indel_bp"] == 50.0
+        assert result["metrics"]["contig_51"]["mean_indel_bp"] == 0.0
+        # Lower indel wins even if absolute AS were comparable
+        assert result["best_contig"] == "contig_51"
+
+    @patch("open_pacmuci.alleles.run_tool_iter")
+    def test_prefers_lower_indel_over_higher_absolute_as(self, mock_run_tool_iter, tmp_path):
+        """Longer contig with higher AS but worse indel loses (ONT bias case)."""
+        # contig_80: high absolute AS (long alignment), large indel mismatch
+        # contig_34: lower AS, near-zero indel (true length match)
+        sam = "\n".join(
+            [
+                _make_sam_line("r1", "contig_80", cigar="100M2000I100M", as_score=5000),
+                _make_sam_line("r2", "contig_80", cigar="100M2000I100M", as_score=5100),
+                _make_sam_line("r3", "contig_34", cigar="2000M", as_score=1900),
+                _make_sam_line("r4", "contig_34", cigar="2000M", as_score=1950),
+            ]
+        )
+        mock_run_tool_iter.return_value = iter(sam.splitlines(keepends=True))
+        bam = tmp_path / "mapping.bam"
+
+        result = refine_peak_contig(bam, ["contig_34", "contig_80"])
+
+        assert result["best_contig"] == "contig_34"
+        assert result["metrics"]["contig_34"]["mean_indel_bp"] == 0.0
+        assert result["metrics"]["contig_80"]["mean_indel_bp"] == 2000.0
 
     @patch("open_pacmuci.alleles.run_tool_iter")
     def test_header_lines_are_skipped(self, mock_run_tool_iter, tmp_path):

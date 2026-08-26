@@ -127,8 +127,17 @@ def refine_peak_contig(
     """Select the best contig from a cluster using alignment quality metrics.
 
     Scans all reads mapped to the cluster contigs and computes per-contig
-    mean alignment score (AS tag) and mean indel length (from CIGAR).
-    The contig with the **highest mean AS** is selected as the best match.
+    mean indel length (from CIGAR), mean alignment score (AS), and
+    length-normalized AS (AS / query length).
+
+    Selection priority (Issue 2 / ONT):
+
+    1. Lowest mean indel bp (best length match to the allele)
+    2. Tie-break with highest length-normalized AS
+    3. Tie-break with highest absolute mean AS
+
+    Absolute AS alone favors longer ladder contigs because AS scales with
+    alignment length, which systematically mis-picks peaks on ONT amplicons.
 
     Args:
         bam_path: Path to the ladder mapping BAM (indexed).
@@ -139,11 +148,13 @@ def refine_peak_contig(
         Dictionary with:
 
         - ``best_contig`` (str): name of the best-matching contig
-        - ``metrics`` (dict): per-contig ``{mean_as, mean_indel_bp, reads}``
+        - ``metrics`` (dict): per-contig ``{mean_as, mean_as_norm,
+          mean_indel_bp, reads}``
     """
     # Accumulate per-contig stats
     contig_stats: dict[str, dict] = {
-        c: {"as_sum": 0, "indel_sum": 0, "count": 0} for c in cluster_contigs
+        c: {"as_sum": 0, "indel_sum": 0, "query_len_sum": 0, "count": 0}
+        for c in cluster_contigs
     }
 
     for line in run_tool_iter(["samtools", "view", str(bam_path), *cluster_contigs]):
@@ -161,6 +172,7 @@ def refine_peak_contig(
         cigar = fields[5]
         contig_stats[contig]["indel_sum"] += _parse_cigar_indel_bp(cigar)
         contig_stats[contig]["count"] += 1
+        contig_stats[contig]["query_len_sum"] += len(fields[9])
 
         # Parse AS tag
         for tag in fields[11:]:
@@ -168,10 +180,10 @@ def refine_peak_contig(
                 contig_stats[contig]["as_sum"] += int(tag[5:])
                 break
 
-    # Compute means and pick best
+    # Compute means and pick best: min indel, then max normalized AS, then AS
     metrics: dict[str, dict] = {}
     best_contig = cluster_contigs[0]
-    best_as = -1.0
+    best_key: tuple[float, float, float] | None = None
 
     for contig, stats in contig_stats.items():
         n = stats["count"]
@@ -179,16 +191,25 @@ def refine_peak_contig(
             continue
         mean_as = stats["as_sum"] / n
         mean_indel = stats["indel_sum"] / n
+        mean_qlen = stats["query_len_sum"] / n
+        mean_as_norm = mean_as / mean_qlen if mean_qlen > 0 else 0.0
         metrics[contig] = {
             "mean_as": round(mean_as, 1),
+            "mean_as_norm": round(mean_as_norm, 4),
             "mean_indel_bp": round(mean_indel, 1),
             "reads": n,
         }
-        if mean_as > best_as:
-            best_as = mean_as
+        # Sort key: lower indel better; higher norm AS better; higher AS better
+        key = (mean_indel, -mean_as_norm, -mean_as)
+        if best_key is None or key < best_key:
+            best_key = key
             best_contig = contig
 
-    logger.debug("Refined peak contig: %s (AS=%.1f)", best_contig, best_as)
+    logger.debug(
+        "Refined peak contig: %s (indel=%.1f)",
+        best_contig,
+        metrics.get(best_contig, {}).get("mean_indel_bp", -1),
+    )
     return {"best_contig": best_contig, "metrics": metrics}
 
 
